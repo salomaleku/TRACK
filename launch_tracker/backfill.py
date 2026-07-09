@@ -23,11 +23,13 @@ class BackfillWorker:
         signatures_per_dev: int = 5,
         concurrency: int = 5,
         on_run: Callable[[], None] | None = None,
+        run_on_start: bool = True,
     ) -> None:
         self._rpc = rpc
         self._get_wallets = get_wallets
         self._on_signature = on_signature
         self._on_run = on_run
+        self._run_on_start = run_on_start
         self._interval = interval_minutes * 60
         self._signatures_per_dev = signatures_per_dev
         self._concurrency = concurrency
@@ -49,7 +51,16 @@ class BackfillWorker:
             self._task = None
 
     async def _loop(self) -> None:
-        await asyncio.sleep(30)  # initial delay — let WebSocket connect first
+        await asyncio.sleep(60)  # let primary stream connect first
+        if not self._run_on_start:
+            log_extra(
+                logger,
+                logging.INFO,
+                "Backfill startup skipped",
+                event="backfill_startup_skipped",
+                next_run_in_minutes=self._interval / 60,
+            )
+            await asyncio.sleep(self._interval)
         while self._running:
             try:
                 await self._run_once()

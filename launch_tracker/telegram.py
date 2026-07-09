@@ -171,6 +171,7 @@ class TelegramService:
         backfill_interval_minutes: int,
         environment: str = "local",
         rpc_rps_limit: float = 10.0,
+        stream_mode: str = "websocket",
     ) -> None:
         backfill_line = (
             f"Backfill: каждые {backfill_interval_minutes} мин"
@@ -178,15 +179,16 @@ class TelegramService:
             else "Backfill: выключен"
         )
         env_label = "🖥 Сервер (private node)" if environment == "server" else "💻 Локально"
+        stream_label = "Geyser gRPC" if stream_mode == "geyser" else "WebSocket"
         text = (
             "🟢 <b>Launch Tracker запущен</b>\n\n"
             "Слежу за новыми лаунчами в реальном времени.\n"
             "Уведомлю, как только один из отслеживаемых "
             "разработчиков запустит токен.\n\n"
             f"<b>Режим</b>: {env_label}\n"
+            f"<b>Stream</b>: {stream_label}\n"
             f"<b>Разработчиков</b>: {developer_count}\n"
             f"<b>RPC лимит</b>: {rpc_rps_limit:.0f} RPS\n"
-            f"<b>WebSocket</b>: подключён\n"
             f"<b>{backfill_line}</b>"
         )
         try:

@@ -37,19 +37,24 @@ def _collect_endpoints(*keys: str) -> list[str]:
 @dataclass(frozen=True, slots=True)
 class Config:
     environment: str  # "local" | "server"
+    stream_mode: str  # "websocket" | "geyser"
     ws_endpoints: list[str]
     rpc_endpoints: list[str]
+    grpc_endpoint: str
+    grpc_x_token: str
     devs_file: Path
     database: Path
     telegram_token: str
     telegram_chat_id: str
     backfill_enabled: bool
+    backfill_on_start: bool
     backfill_interval_minutes: int
     log_level: str
 
     # Rate limiting
     rpc_rps_limit: float
     rpc_max_retries: int
+    tx_processor_concurrency: int
 
     # WebSocket tuning
     ws_reconnect_base_seconds: float
@@ -69,6 +74,7 @@ class Config:
     @classmethod
     def from_env(cls) -> Config:
         environment = os.getenv("ENVIRONMENT", "local").strip().lower()
+        stream_mode = os.getenv("STREAM_MODE", "geyser" if environment == "server" else "websocket").strip().lower()
 
         rpc_endpoints = _collect_endpoints(
             "RPC_ENDPOINT", "RPC_ENDPOINT_2", "RPC_ENDPOINT_3"
@@ -77,9 +83,12 @@ class Config:
             "WS_ENDPOINT", "WS_ENDPOINT_2", "WS_ENDPOINT_3"
         )
 
-        # Presets: local = conservative, server = private node (200 RPS)
-        default_rps = 200.0 if environment == "server" else 10.0
-        default_backfill_concurrency = 15 if environment == "server" else 2
+        # Server: conservative HTTP RPC (backfill only), Geyser handles realtime
+        default_rps = 80.0 if environment == "server" else 10.0
+        default_backfill_concurrency = 3 if environment == "server" else 2
+        default_backfill_sigs = 2 if environment == "server" else 3
+        default_processor_concurrency = 8 if environment == "server" else 3
+        default_backfill_on_start = environment != "server"
 
         rpc_rps_raw = os.getenv("RPC_RPS_LIMIT", "").strip()
         rpc_rps_limit = float(rpc_rps_raw) if rpc_rps_raw else default_rps
@@ -93,22 +102,31 @@ class Config:
 
         return cls(
             environment=environment,
+            stream_mode=stream_mode,
             ws_endpoints=ws_endpoints,
             rpc_endpoints=rpc_endpoints,
+            grpc_endpoint=os.getenv("GRPC_ENDPOINT", "").strip(),
+            grpc_x_token=os.getenv("GRPC_X_TOKEN", "").strip(),
             devs_file=Path(os.getenv("DEVS_FILE", "data/devs.txt")),
             database=Path(os.getenv("DATABASE", "data/launch_tracker.db")),
             telegram_token=os.getenv("TELEGRAM_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             backfill_enabled=_bool(os.getenv("BACKFILL_ENABLED"), True),
+            backfill_on_start=_bool(os.getenv("BACKFILL_ON_START"), default_backfill_on_start),
             backfill_interval_minutes=_int(os.getenv("BACKFILL_INTERVAL_MINUTES"), 10),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             rpc_rps_limit=rpc_rps_limit,
-            rpc_max_retries=_int(os.getenv("RPC_MAX_RETRIES"), 3),
+            rpc_max_retries=_int(os.getenv("RPC_MAX_RETRIES"), 5),
+            tx_processor_concurrency=_int(
+                os.getenv("TX_PROCESSOR_CONCURRENCY"), default_processor_concurrency
+            ),
             ws_reconnect_base_seconds=float(os.getenv("WS_RECONNECT_BASE_SECONDS", "1.0")),
             ws_reconnect_max_seconds=float(os.getenv("WS_RECONNECT_MAX_SECONDS", "60.0")),
             ws_heartbeat_seconds=float(os.getenv("WS_HEARTBEAT_SECONDS", "30.0")),
             ws_subscription_batch_size=_int(os.getenv("WS_SUBSCRIPTION_BATCH_SIZE"), 20),
-            backfill_signatures_per_dev=_int(os.getenv("BACKFILL_SIGNATURES_PER_DEV"), 5),
+            backfill_signatures_per_dev=_int(
+                os.getenv("BACKFILL_SIGNATURES_PER_DEV"), default_backfill_sigs
+            ),
             backfill_concurrency=backfill_concurrency,
             tx_queue_size=_int(os.getenv("TX_QUEUE_SIZE"), 10_000),
             devs_reload_seconds=float(os.getenv("DEVS_RELOAD_SECONDS", "30.0")),
@@ -127,8 +145,11 @@ class Config:
         errors: list[str] = []
         if not self.rpc_endpoints:
             errors.append("RPC_ENDPOINT is required")
-        if not self.ws_endpoints:
-            errors.append("WS_ENDPOINT is required")
+        if self.stream_mode == "geyser":
+            if not self.grpc_endpoint:
+                errors.append("GRPC_ENDPOINT is required when STREAM_MODE=geyser")
+        elif not self.ws_endpoints:
+            errors.append("WS_ENDPOINT is required when STREAM_MODE=websocket")
         if not self.telegram_token:
             errors.append("TELEGRAM_TOKEN is required")
         if not self.telegram_chat_id:

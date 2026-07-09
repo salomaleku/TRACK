@@ -13,12 +13,13 @@ import aiohttp
 from launch_tracker.backfill import BackfillWorker
 from launch_tracker.config import Config
 from launch_tracker.database import Database
+from launch_tracker.geyser import GeyserTransactionStream
 from launch_tracker.launch_detector import LaunchDetector
 from launch_tracker.logging_setup import log_extra
 from launch_tracker.models import LaunchEvent, ServiceMetrics, TransactionEvent
 from launch_tracker.rpc import RpcClient
 from launch_tracker.telegram import TelegramService
-from launch_tracker.websocket import JsonRpcWebSocket
+from launch_tracker.websocket import JsonRpcWebSocket, TransactionWebSocket
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,8 @@ class LaunchTrackerService:
         self._tx_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=config.tx_queue_size)
         self._session: aiohttp.ClientSession | None = None
         self._rpc: RpcClient | None = None
-        self._ws: JsonRpcWebSocket | None = None
+        self._stream: TransactionWebSocket | None = None
+        self._processor_sem: asyncio.Semaphore | None = None
         self._telegram: TelegramService | None = None
         self._backfill: BackfillWorker | None = None
         self._tasks: list[asyncio.Task] = []
@@ -132,8 +134,8 @@ class LaunchTrackerService:
         return self._metrics
 
     def _get_metrics(self) -> ServiceMetrics:
-        if self._ws:
-            self._metrics.reconnect_count = self._ws.reconnect_count
+        if self._stream:
+            self._metrics.reconnect_count = self._stream.reconnect_count
         return self._metrics
 
     async def start(self) -> None:
@@ -156,15 +158,25 @@ class LaunchTrackerService:
             max_retries=self._config.rpc_max_retries,
         )
 
-        self._ws = JsonRpcWebSocket(
-            endpoint=self._config.ws_endpoint,
-            batch_size=self._config.ws_subscription_batch_size,
-            reconnect_base=self._config.ws_reconnect_base_seconds,
-            reconnect_max=self._config.ws_reconnect_max_seconds,
-            heartbeat_seconds=self._config.ws_heartbeat_seconds,
-        )
-        await self._ws.update_wallets(wallets)
-        await self._ws.connect()
+        self._processor_sem = asyncio.Semaphore(self._config.tx_processor_concurrency)
+
+        if self._config.stream_mode == "geyser":
+            self._stream = GeyserTransactionStream(
+                endpoint=self._config.grpc_endpoint,
+                x_token=self._config.grpc_x_token or None,
+                reconnect_base=self._config.ws_reconnect_base_seconds,
+                reconnect_max=self._config.ws_reconnect_max_seconds,
+            )
+        else:
+            self._stream = JsonRpcWebSocket(
+                endpoint=self._config.ws_endpoint,
+                batch_size=self._config.ws_subscription_batch_size,
+                reconnect_base=self._config.ws_reconnect_base_seconds,
+                reconnect_max=self._config.ws_reconnect_max_seconds,
+                heartbeat_seconds=self._config.ws_heartbeat_seconds,
+            )
+        await self._stream.update_wallets(wallets)
+        await self._stream.connect()
 
         self._telegram = TelegramService(
             token=self._config.telegram_token,
@@ -181,6 +193,7 @@ class LaunchTrackerService:
             backfill_interval_minutes=self._config.backfill_interval_minutes,
             environment=self._config.environment,
             rpc_rps_limit=self._config.rpc_rps_limit,
+            stream_mode=self._config.stream_mode,
         )
 
         if self._config.backfill_enabled:
@@ -193,11 +206,12 @@ class LaunchTrackerService:
                 signatures_per_dev=self._config.backfill_signatures_per_dev,
                 concurrency=self._config.backfill_concurrency,
                 on_run=lambda: setattr(self._metrics, "backfill_runs", self._metrics.backfill_runs + 1),
+                run_on_start=self._config.backfill_on_start,
             )
             await self._backfill.start()
 
         self._running = True
-        self._tasks.append(asyncio.create_task(self._ws_consumer_loop(), name="ws-consumer"))
+        self._tasks.append(asyncio.create_task(self._stream_consumer_loop(), name="stream-consumer"))
         self._tasks.append(asyncio.create_task(self._processor_loop(), name="tx-processor"))
         self._tasks.append(
             asyncio.create_task(
@@ -212,6 +226,7 @@ class LaunchTrackerService:
             "Launch Tracker started",
             event="service_started",
             environment=self._config.environment,
+            stream_mode=self._config.stream_mode,
             developers=len(wallets),
             rpc_endpoints=len(self._config.rpc_endpoints),
             rpc_rps_limit=self._config.rpc_rps_limit,
@@ -228,8 +243,8 @@ class LaunchTrackerService:
 
         if self._backfill:
             await self._backfill.stop()
-        if self._ws:
-            await self._ws.disconnect()
+        if self._stream:
+            await self._stream.disconnect()
         if self._telegram:
             await self._telegram.stop()
         if self._session:
@@ -241,13 +256,13 @@ class LaunchTrackerService:
     async def _on_wallets_changed(self, wallets: set[str]) -> None:
         self._detector.update_wallets(wallets)
         await self._db.sync_developers(wallets)
-        if self._ws:
-            await self._ws.update_wallets(wallets)
+        if self._stream:
+            await self._stream.update_wallets(wallets)
 
-    async def _ws_consumer_loop(self) -> None:
-        assert self._ws is not None
-        async for signature in self._ws.signatures():
-            await self._enqueue_signature(signature, source="websocket")
+    async def _stream_consumer_loop(self) -> None:
+        assert self._stream is not None
+        async for signature in self._stream.signatures():
+            await self._enqueue_signature(signature, source=self._config.stream_mode)
 
     async def _enqueue_signature(self, signature: str, source: str = "backfill") -> None:
         try:
@@ -263,9 +278,14 @@ class LaunchTrackerService:
                 continue
 
             asyncio.create_task(
-                self._process_signature(signature, source),
+                self._bounded_process(signature, source),
                 name=f"process-{signature[:8]}",
             )
+
+    async def _bounded_process(self, signature: str, source: str) -> None:
+        assert self._processor_sem is not None
+        async with self._processor_sem:
+            await self._process_signature(signature, source)
 
     async def _process_signature(self, signature: str, source: str) -> None:
         started = time.monotonic()

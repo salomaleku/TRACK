@@ -98,6 +98,7 @@ class JsonRpcWebSocket(TransactionWebSocket):
         self._running = False
         self._reconnect_count = 0
         self._subscription_ids: list[int] = []
+        self._ws_events = 0
         self._tasks: list[asyncio.Task] = []
 
     @property
@@ -251,6 +252,16 @@ class JsonRpcWebSocket(TransactionWebSocket):
         # logsNotification format
         signature = value.get("signature")
         if signature:
+            self._ws_events += 1
+            if self._ws_events <= 3 or self._ws_events % 50 == 0:
+                log_extra(
+                    logger,
+                    logging.INFO,
+                    "WebSocket transaction received",
+                    event="ws_tx_received",
+                    signature=signature[:16],
+                    total=self._ws_events,
+                )
             await self._queue.put(signature)
             return
 
