@@ -166,6 +166,7 @@ class LaunchTrackerService:
                 x_token=self._config.grpc_x_token or None,
                 reconnect_base=self._config.ws_reconnect_base_seconds,
                 reconnect_max=self._config.ws_reconnect_max_seconds,
+                wallet_batch_size=self._config.ws_subscription_batch_size,
             )
         else:
             self._stream = JsonRpcWebSocket(

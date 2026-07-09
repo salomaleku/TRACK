@@ -28,7 +28,8 @@ EVENT_LABELS: dict[str, str] = {
     "ws_message_error": "WS message error",
     "ws_tx_received": "WS tx",
     "geyser_connecting": "Geyser connecting",
-    "geyser_connected": "Geyser connected",
+    "geyser_ready": "Geyser ready",
+    "geyser_connected": "Geyser subscribed",
     "geyser_disconnected": "Geyser disconnected",
     "geyser_tx_received": "Geyser tx",
     "queue_full": "Queue full",
@@ -54,6 +55,7 @@ _FIELD_ORDER = (
     "developers",
     "devs",
     "wallets",
+    "batches",
     "count",
     "endpoint",
     "signature",
@@ -92,6 +94,7 @@ _KEY_ALIASES: dict[str, str] = {
     "backfill_concurrency": "backfill",
     "reconnect_in_seconds": "retry_in",
     "reconnect_count": "retries",
+    "has_token": "token",
 }
 
 

@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import queue
-import threading
-from collections.abc import AsyncIterator, Callable
-from typing import Any
+from collections.abc import AsyncIterator, Iterable
+from urllib.parse import urlparse
 
 import grpc
 
@@ -18,6 +16,15 @@ from launch_tracker.websocket import TransactionWebSocket
 logger = logging.getLogger(__name__)
 
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+_GRPC_CHANNEL_OPTIONS = (
+    ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+    ("grpc.keepalive_time_ms", 30_000),
+    ("grpc.keepalive_timeout_ms", 10_000),
+    ("grpc.keepalive_permit_without_calls", 1),
+)
+
+DEFAULT_WALLET_BATCH_SIZE = 20
 
 
 def _b58encode(data: bytes) -> str:
@@ -37,24 +44,50 @@ def _b58encode(data: bytes) -> str:
     return "1" * pad + "".join(reversed(chars))
 
 
-def _build_subscribe_request(wallets: list[str]) -> geyser_pb2.SubscribeRequest:
+def _normalize_grpc_target(endpoint: str) -> str:
+    value = endpoint.strip()
+    if "://" in value:
+        parsed = urlparse(value)
+        host = parsed.hostname or ""
+        if parsed.port:
+            return f"{host}:{parsed.port}"
+        return host
+    return value
+
+
+def _format_grpc_error(exc: BaseException) -> str:
+    if isinstance(exc, grpc.RpcError):
+        code = exc.code()
+        details = exc.details() or ""
+        return f"{code.name}: {details}".strip(": ")
+    return str(exc)
+
+
+def _valid_wallets(wallets: Iterable[str]) -> list[str]:
+    valid: list[str] = []
+    for wallet in wallets:
+        w = wallet.strip()
+        if len(w) < 32 or len(w) > 44:
+            continue
+        if all(c in _B58 for c in w):
+            valid.append(w)
+    return sorted(valid)
+
+
+def _build_subscribe_request(wallets: list[str], batch_size: int) -> geyser_pb2.SubscribeRequest:
     req = geyser_pb2.SubscribeRequest()
-    tx_filter = geyser_pb2.SubscribeRequestFilterTransactions(
-        vote=False,
-        failed=False,
-        account_include=sorted(wallets),
-    )
-    req.transactions["dev_wallets"].CopyFrom(tx_filter)
+    batches = [wallets[i : i + batch_size] for i in range(0, len(wallets), batch_size)]
+    for batch_id, batch in enumerate(batches):
+        tx_filter = req.transactions[f"devs_{batch_id}"]
+        tx_filter.account_include.extend(batch)
+        tx_filter.vote = False
+        tx_filter.failed = False
     req.commitment = geyser_pb2.CommitmentLevel.CONFIRMED
     return req
 
 
 class GeyserTransactionStream(TransactionWebSocket):
-    """Stream dev-wallet transactions via Yellowstone gRPC.
-
-    Corvus endpoint example: http://fra.corvus-labs.io:10101
-    Starter tier (200 RPS): up to 200 accounts in account_include — all 76 devs fit in one filter.
-    """
+    """Stream dev-wallet transactions via Yellowstone gRPC."""
 
     def __init__(
         self,
@@ -62,22 +95,22 @@ class GeyserTransactionStream(TransactionWebSocket):
         x_token: str | None = None,
         reconnect_base: float = 1.0,
         reconnect_max: float = 60.0,
+        wallet_batch_size: int = DEFAULT_WALLET_BATCH_SIZE,
     ) -> None:
-        self._endpoint = endpoint.replace("grpc://", "http://")
-        if not self._endpoint.startswith("http"):
-            self._endpoint = f"http://{self._endpoint}"
+        self._endpoint = _normalize_grpc_target(endpoint)
         self._x_token = x_token
         self._reconnect_base = reconnect_base
         self._reconnect_max = reconnect_max
+        self._wallet_batch_size = wallet_batch_size
 
         self._wallets: set[str] = set()
         self._sig_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._request_queue: queue.Queue[Any] = queue.Queue()
+        self._request_queue: asyncio.Queue[geyser_pb2.SubscribeRequest | None] = asyncio.Queue()
         self._running = False
         self._reconnect_count = 0
         self._events_received = 0
-        self._thread: threading.Thread | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task | None = None
+        self._resubscribe = asyncio.Event()
 
     @property
     def reconnect_count(self) -> int:
@@ -87,21 +120,20 @@ class GeyserTransactionStream(TransactionWebSocket):
         if self._running:
             return
         self._running = True
-        self._loop = asyncio.get_running_loop()
-        self._thread = threading.Thread(target=self._run_thread, name="geyser-stream", daemon=True)
-        self._thread.start()
+        self._task = asyncio.create_task(self._run_loop(), name="geyser-stream")
 
     async def disconnect(self) -> None:
         self._running = False
-        self._request_queue.put(None)
-        if self._thread:
-            self._thread.join(timeout=5)
-            self._thread = None
+        await self._request_queue.put(None)
+        if self._task:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
 
     async def update_wallets(self, wallets: set[str]) -> None:
         self._wallets = set(wallets)
         if self._wallets and self._running:
-            self._request_queue.put(_build_subscribe_request(list(self._wallets)))
+            self._resubscribe.set()
 
     def signatures(self) -> AsyncIterator[str]:
         return self._iter_signatures()
@@ -114,12 +146,14 @@ class GeyserTransactionStream(TransactionWebSocket):
             except asyncio.TimeoutError:
                 continue
 
-    def _run_thread(self) -> None:
+    async def _run_loop(self) -> None:
         attempt = 0
         while self._running:
             try:
-                self._subscribe_once()
+                await self._subscribe_once()
                 attempt = 0
+            except asyncio.CancelledError:
+                break
             except Exception as exc:
                 if not self._running:
                     break
@@ -131,60 +165,98 @@ class GeyserTransactionStream(TransactionWebSocket):
                     logging.WARNING,
                     "Geyser disconnected",
                     event="geyser_disconnected",
-                    error=str(exc),
+                    error=_format_grpc_error(exc),
                     reconnect_in_seconds=delay,
                     reconnect_count=self._reconnect_count,
                 )
-                threading.Event().wait(delay)
+                await asyncio.sleep(delay)
 
-    def _subscribe_once(self) -> None:
-        assert self._loop is not None
+    def _grpc_metadata(self) -> list[tuple[str, str]] | None:
+        if self._x_token:
+            return [("x-token", self._x_token)]
+        return None
+
+    async def _request_generator(
+        self,
+        initial: geyser_pb2.SubscribeRequest,
+    ) -> AsyncIterator[geyser_pb2.SubscribeRequest]:
+        yield initial
+        while self._running:
+            req = await self._request_queue.get()
+            if req is None:
+                break
+            yield req
+
+    async def _subscribe_once(self) -> None:
+        wallets = _valid_wallets(self._wallets)
+        if not wallets:
+            raise RuntimeError("No valid developer wallets for Geyser subscription")
+
+        batch_count = (len(wallets) + self._wallet_batch_size - 1) // self._wallet_batch_size
         log_extra(
             logger,
             logging.INFO,
             "Geyser connecting",
             event="geyser_connecting",
             endpoint=self._endpoint,
+            wallets=len(wallets),
+            batches=batch_count,
         )
 
-        channel = grpc.insecure_channel(
-            self._endpoint,
-            options=[("grpc.max_receive_message_length", 64 * 1024 * 1024)],
-        )
+        channel = grpc.aio.insecure_channel(self._endpoint, options=_GRPC_CHANNEL_OPTIONS)
         stub = geyser_pb2_grpc.GeyserStub(channel)
+        metadata = self._grpc_metadata()
 
-        if self._wallets:
-            self._request_queue.put(_build_subscribe_request(list(self._wallets)))
+        try:
+            version = await stub.GetVersion(
+                geyser_pb2.GetVersionRequest(),
+                metadata=metadata,
+                timeout=10,
+            )
+            log_extra(
+                logger,
+                logging.INFO,
+                "Geyser ready",
+                event="geyser_ready",
+                version=version.version,
+                wallets=len(wallets),
+            )
 
-        def request_iterator():
-            while self._running:
-                req = self._request_queue.get()
-                if req is None:
+            initial = _build_subscribe_request(wallets, self._wallet_batch_size)
+            stream = stub.Subscribe(
+                self._request_generator(initial),
+                metadata=metadata,
+            )
+            log_extra(
+                logger,
+                logging.INFO,
+                "Geyser subscribed",
+                event="geyser_connected",
+                wallets=len(wallets),
+                batches=batch_count,
+            )
+
+            self._resubscribe.clear()
+            async for update in stream:
+                if not self._running:
                     break
-                yield req
+                if self._resubscribe.is_set():
+                    self._resubscribe.clear()
+                    refreshed = _build_subscribe_request(
+                        _valid_wallets(self._wallets),
+                        self._wallet_batch_size,
+                    )
+                    await self._request_queue.put(refreshed)
+                await self._handle_update(update)
+        finally:
+            await channel.close()
 
-        metadata = [("x-token", self._x_token)] if self._x_token else None
-
-        stream = stub.Subscribe(request_iterator(), metadata=metadata)
-        log_extra(
-            logger,
-            logging.INFO,
-            "Geyser connected",
-            event="geyser_connected",
-            wallet_count=len(self._wallets),
-        )
-
-        for update in stream:
-            if not self._running:
-                break
-            self._handle_update(update)
-
-    def _handle_update(self, update: geyser_pb2.SubscribeUpdate) -> None:
-        assert self._loop is not None
-
+    async def _handle_update(self, update: geyser_pb2.SubscribeUpdate) -> None:
         if update.HasField("ping"):
-            self._request_queue.put(
-                geyser_pb2.SubscribeRequest(ping=geyser_pb2.SubscribeRequestPing(id=1))
+            await self._request_queue.put(
+                geyser_pb2.SubscribeRequest(
+                    ping=geyser_pb2.SubscribeRequestPing(id=1),
+                )
             )
             return
 
@@ -213,4 +285,4 @@ class GeyserTransactionStream(TransactionWebSocket):
                 slot=update.transaction.slot,
             )
 
-        asyncio.run_coroutine_threadsafe(self._sig_queue.put(signature), self._loop)
+        await self._sig_queue.put(signature)

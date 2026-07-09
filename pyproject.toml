@@ -9,6 +9,7 @@ dependencies = [
     "aiohttp>=3.10,<4",
     "aiosqlite>=0.20,<1",
     "grpcio>=1.60,<2",
+    "protobuf>=7.35,<8",
     "python-dotenv>=1.0,<2",
     "websockets>=13,<14",
 ]
