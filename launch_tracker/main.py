@@ -26,8 +26,11 @@ async def run() -> None:
         log_extra(logger, logging.INFO, "Shutdown signal received", event="shutdown_signal")
         stop_event.set()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _signal_handler)
+    if sys.platform == "win32":
+        signal.signal(signal.SIGINT, lambda _s, _f: _signal_handler())
+    else:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _signal_handler)
 
     await service.start()
 

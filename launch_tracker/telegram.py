@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import resource
 import sys
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
@@ -23,11 +22,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _memory_usage_mb() -> float:
-    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "darwin":
-        return usage / (1024 * 1024)
-    return usage / 1024
+def _memory_usage_mb() -> float | None:
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return usage / (1024 * 1024)
+        return usage / 1024
+    except (ImportError, ModuleNotFoundError):
+        # resource module is Unix-only; not available on Windows
+        return None
 
 
 def format_launch_message(event: LaunchEvent, explorer_base: str) -> str:
@@ -136,6 +141,9 @@ class TelegramService:
             db_size = self._db.path.stat().st_size if self._db.path.exists() else 0
             uptime_h = m.uptime_seconds / 3600
 
+            mem = _memory_usage_mb()
+            mem_line = f"{mem:.1f} MB" if mem is not None else "N/A (Windows)"
+
             await message.answer(
                 "<b>Launch Tracker Stats</b>\n\n"
                 f"<b>Tracked developers</b>\n{dev_count}\n\n"
@@ -147,7 +155,7 @@ class TelegramService:
                 f"<b>Backfill runs</b>\n{m.backfill_runs}\n\n"
                 f"<b>Avg detection latency</b>\n{m.avg_detection_latency_ms:.0f}ms\n\n"
                 f"<b>Avg processing time</b>\n{m.avg_processing_time_ms:.0f}ms\n\n"
-                f"<b>Memory usage</b>\n{_memory_usage_mb():.1f} MB\n\n"
+                f"<b>Memory usage</b>\n{mem_line}\n\n"
                 f"<b>SQLite size</b>\n{db_size / 1024:.1f} KB"
             )
 
