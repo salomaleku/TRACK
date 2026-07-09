@@ -35,7 +35,11 @@ def _memory_usage_mb() -> float | None:
         return None
 
 
-def format_launch_message(event: LaunchEvent, explorer_base: str) -> str:
+def format_launch_message(
+    event: LaunchEvent,
+    explorer_base: str,
+    gmgn_token_base: str = "https://gmgn.ai/sol/token/",
+) -> str:
     time_str = (
         event.block_time.strftime("%Y-%m-%d %H:%M:%S UTC")
         if event.block_time
@@ -44,6 +48,7 @@ def format_launch_message(event: LaunchEvent, explorer_base: str) -> str:
     name = event.token_name or "—"
     symbol = event.token_symbol or "—"
     explorer = f"{explorer_base}{event.signature}"
+    gmgn = f"{gmgn_token_base.rstrip('/')}/{event.token_mint}"
 
     return (
         "🚀 <b>NEW DEV LAUNCH</b>\n\n"
@@ -55,7 +60,8 @@ def format_launch_message(event: LaunchEvent, explorer_base: str) -> str:
         f"<b>Time</b>\n{time_str}\n\n"
         f"<b>Slot</b>\n{event.slot}\n\n"
         f"<b>Signature</b>\n<code>{event.signature}</code>\n\n"
-        f'<a href="{explorer}">Explorer Link</a>'
+        f'<a href="{explorer}">Solscan</a> · '
+        f'<a href="{gmgn}">GMGN Chart</a>'
     )
 
 
@@ -68,12 +74,14 @@ class TelegramService:
         metrics: ServiceMetrics,
         get_metrics: Callable[[], ServiceMetrics],
         explorer_base: str,
+        gmgn_token_base: str = "https://gmgn.ai/sol/token/",
     ) -> None:
         self._chat_id = chat_id
         self._db = database
         self._metrics = metrics
         self._get_metrics = get_metrics
         self._explorer_base = explorer_base
+        self._gmgn_token_base = gmgn_token_base
         self._bot = Bot(token=token)
         self._dp = Dispatcher()
         self._send_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
@@ -235,7 +243,11 @@ class TelegramService:
             except asyncio.TimeoutError:
                 continue
             try:
-                text = format_launch_message(event, self._explorer_base)
+                text = format_launch_message(
+                    event,
+                    self._explorer_base,
+                    self._gmgn_token_base,
+                )
                 await self._bot.send_message(
                     self._chat_id,
                     text,

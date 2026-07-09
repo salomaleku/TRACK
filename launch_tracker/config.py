@@ -70,6 +70,7 @@ class Config:
     tx_queue_size: int
     devs_reload_seconds: float
     explorer_base: str
+    gmgn_token_base: str
 
     @classmethod
     def from_env(cls) -> Config:
@@ -131,6 +132,9 @@ class Config:
             tx_queue_size=_int(os.getenv("TX_QUEUE_SIZE"), 10_000),
             devs_reload_seconds=float(os.getenv("DEVS_RELOAD_SECONDS", "30.0")),
             explorer_base=os.getenv("EXPLORER_BASE", "https://solscan.io/tx/").strip(),
+            gmgn_token_base=os.getenv(
+                "GMGN_TOKEN_BASE", "https://gmgn.ai/sol/token/"
+            ).strip(),
         )
 
     @property

@@ -186,6 +186,7 @@ class LaunchTrackerService:
             metrics=self._metrics,
             get_metrics=self._get_metrics,
             explorer_base=self._config.explorer_base,
+            gmgn_token_base=self._config.gmgn_token_base,
         )
         await self._telegram.start()
         await self._telegram.send_startup_alert(
