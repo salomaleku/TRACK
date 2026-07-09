@@ -17,8 +17,19 @@ TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 METAPLEX_METADATA = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-# Pump.fun create instruction discriminator (first 8 bytes of sha256("global:create"))
-PUMP_CREATE_DISCRIMINATOR = bytes([24, 30, 200, 40, 5, 28, 7, 119])
+# Anchor discriminators for pump.fun create instructions (global:<name>).
+PUMP_CREATE_DISCRIMINATORS = frozenset(
+    {
+        bytes([24, 30, 200, 40, 5, 28, 7, 119]),  # create
+        bytes([214, 144, 76, 236, 95, 139, 49, 180]),  # create_v2
+        bytes([246, 164, 68, 157, 140, 248, 240, 90]),  # create_v2 variant (Token-2022)
+    }
+)
+
+# create_v2 account layout: user/creator is index 5, mint is index 0.
+PUMP_CREATE_V2_MIN_ACCOUNTS = 16
+PUMP_CREATE_USER_ACCOUNT_INDEX = 5
+PUMP_CREATE_MINT_ACCOUNT_INDEX = 0
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -89,29 +100,49 @@ class LaunchDetector:
             return None
         return datetime.fromtimestamp(block_time, tz=timezone.utc)
 
+    def _resolve_account(self, ref: int | str, keys: list[str]) -> str | None:
+        """Resolve account ref from jsonParsed (pubkey) or legacy (index)."""
+        if isinstance(ref, str):
+            return ref
+        if isinstance(ref, int) and 0 <= ref < len(keys):
+            return keys[ref]
+        return None
+
     def _detect_pump_fun(self, event: TransactionEvent, developer: str) -> LaunchEvent | None:
         message = event.transaction.get("message", {})
+        keys = self._all_account_keys(event)
+
         for ix in message.get("instructions", []):
-            program_id = ix.get("programId", "")
-            if program_id != PUMP_FUN_PROGRAM:
-                continue
-            data = ix.get("data", "")
-            if not data:
-                continue
-            try:
-                raw = _b58decode(data)
-            except (ValueError, IndexError):
-                continue
-            if len(raw) < 8 or raw[:8] != PUMP_CREATE_DISCRIMINATOR:
+            if ix.get("programId") != PUMP_FUN_PROGRAM:
                 continue
 
             accounts = ix.get("accounts", [])
-            keys = self._all_account_keys(event)
-            mint = keys[accounts[0]] if accounts and accounts[0] < len(keys) else None
-            if not mint:
+            if len(accounts) < PUMP_CREATE_V2_MIN_ACCOUNTS:
                 continue
 
-            name, symbol = self._extract_pump_metadata(raw)
+            mint = self._resolve_account(
+                accounts[PUMP_CREATE_MINT_ACCOUNT_INDEX], keys
+            )
+            user = self._resolve_account(
+                accounts[PUMP_CREATE_USER_ACCOUNT_INDEX], keys
+            )
+            if not mint or user != developer:
+                continue
+
+            name: str | None = None
+            symbol: str | None = None
+            data = ix.get("data", "")
+            if data:
+                try:
+                    raw = _b58decode(data)
+                except (ValueError, IndexError):
+                    continue
+                if len(raw) < 8 or raw[:8] not in PUMP_CREATE_DISCRIMINATORS:
+                    continue
+                name, symbol = self._extract_pump_metadata(raw)
+            elif len(accounts) != PUMP_CREATE_V2_MIN_ACCOUNTS:
+                continue
+
             return LaunchEvent(
                 developer_wallet=developer,
                 token_mint=mint,
@@ -126,7 +157,7 @@ class LaunchDetector:
         return None
 
     def _extract_pump_metadata(self, data: bytes) -> tuple[str | None, str | None]:
-        """Parse name/symbol from pump.fun create instruction data."""
+        """Parse name/symbol from pump.fun create / create_v2 instruction data."""
         try:
             offset = 8  # skip discriminator
             name_len = struct.unpack_from("<I", data, offset)[0]
@@ -215,9 +246,9 @@ class LaunchDetector:
                 continue
             # mint is typically account index 1 in create metadata
             mint_idx = accounts[1] if len(accounts) > 1 else None
-            if mint_idx is None or mint_idx >= len(keys):
+            mint = self._resolve_account(mint_idx, keys) if mint_idx is not None else None
+            if not mint:
                 continue
-            mint = keys[mint_idx]
             return LaunchEvent(
                 developer_wallet=developer,
                 token_mint=mint,
