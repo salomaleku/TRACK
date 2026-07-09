@@ -1,0 +1,23 @@
+[project]
+name = "launch-tracker"
+version = "1.0.0"
+description = "Realtime Solana developer launch monitoring with WebSocket subscriptions"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.13,<4",
+    "aiohttp>=3.10,<4",
+    "aiosqlite>=0.20,<1",
+    "python-dotenv>=1.0,<2",
+    "websockets>=13,<14",
+]
+
+[project.scripts]
+launch-tracker = "launch_tracker.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["launch_tracker*"]
