@@ -41,15 +41,25 @@ class TradeEvent:
     wallet: str
     side: str  # "buy" | "sell"
     token_mint: str
+    token_symbol: str
     token_name: str | None
-    token_symbol: str | None
-    developer_wallet: str | None
     sol_amount: float
     token_amount: float
+    sol_delta: float
+    fee_sol: float
+    tip_sol: float
+    price_usd: float | None
+    swap_usd: float | None
+    sol_delta_usd: float | None
+    token_delta_usd: float | None
     market_cap_usd: float | None
-    slot_diff: int | None
-    pnl_pct: float | None
+    holds_tokens: float
+    holds_pct: float
     sold_pct: float | None
+    pnl_pct: float | None
+    pnl_usd: float | None
+    upnl_usd: float | None
+    seen_seconds: int | None
     signature: str
     slot: int
     block_time: datetime | None

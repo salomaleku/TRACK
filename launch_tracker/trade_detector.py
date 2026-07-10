@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
 
 from launch_tracker.models import TradeEvent, TransactionEvent
 from launch_tracker.pump_utils import (
     MIN_TRADE_SOL,
+    PUMP_TOTAL_SUPPLY,
+    display_symbol,
     estimate_market_cap_usd,
+    extract_tip_sol,
     fee_payer,
     largest_sol_transfer_out,
     pump_trade_side,
+    seen_seconds_from_slots,
     sol_sell_proceeds,
+    token_balance_pre_post,
+    tx_fee_sol,
+    wallet_sol_delta,
     wallet_token_delta,
 )
 
@@ -33,11 +39,8 @@ class TradeDetector:
         *,
         sol_usd: float,
         launch_slot: int | None = None,
-        developer_wallet: str | None = None,
         token_name: str | None = None,
         token_symbol: str | None = None,
-        pnl_pct: float | None = None,
-        sold_pct: float | None = None,
     ) -> TradeEvent | None:
         if event.meta.get("err"):
             return None
@@ -58,6 +61,10 @@ class TradeDetector:
         if tokens <= 0:
             return None
 
+        pre_bal, post_bal = token_balance_pre_post(event.meta, wallet, mint)
+        fee_sol = tx_fee_sol(event.meta)
+        sol_delta = wallet_sol_delta(event.meta, event.transaction, wallet)
+
         if side == "buy":
             if delta <= 0:
                 return None
@@ -70,24 +77,47 @@ class TradeDetector:
         if sol is None or sol < MIN_TRADE_SOL:
             return None
 
-        mc_usd = estimate_market_cap_usd(sol, tokens, sol_usd)
-        slot_diff: int | None = None
-        if side == "buy" and launch_slot is not None:
-            slot_diff = event.slot - launch_slot
+        main_lamports = int(sol * 1_000_000_000)
+        tip_sol = extract_tip_sol(event.meta, event.transaction, wallet, main_lamports)
+
+        price_usd = (sol / tokens) * sol_usd if tokens > 0 else None
+        swap_usd = sol * sol_usd
+        token_delta_usd = swap_usd if side == "buy" else -swap_usd
+        sol_delta_val = sol_delta if sol_delta is not None else (sol if side == "sell" else -sol)
+        sol_delta_usd = sol_delta_val * sol_usd
+
+        holds_tokens = post_bal
+        holds_pct = holds_tokens / PUMP_TOTAL_SUPPLY * 100.0
+
+        sold_pct: float | None = None
+        if side == "sell" and pre_bal > 0:
+            sold_pct = round(min(100.0, tokens / pre_bal * 100.0), 1)
+
+        symbol = display_symbol(token_symbol, mint)
 
         return TradeEvent(
             wallet=wallet,
             side=side,
             token_mint=mint,
+            token_symbol=symbol,
             token_name=token_name,
-            token_symbol=token_symbol,
-            developer_wallet=developer_wallet,
             sol_amount=sol,
             token_amount=tokens,
-            market_cap_usd=mc_usd,
-            slot_diff=slot_diff,
-            pnl_pct=pnl_pct if side == "sell" else None,
-            sold_pct=sold_pct if side == "sell" else None,
+            sol_delta=sol_delta_val,
+            fee_sol=fee_sol,
+            tip_sol=tip_sol,
+            price_usd=price_usd,
+            swap_usd=swap_usd,
+            sol_delta_usd=sol_delta_usd,
+            token_delta_usd=token_delta_usd,
+            market_cap_usd=estimate_market_cap_usd(sol, tokens, sol_usd),
+            holds_tokens=holds_tokens,
+            holds_pct=holds_pct,
+            sold_pct=sold_pct,
+            pnl_pct=None,
+            pnl_usd=None,
+            upnl_usd=None,
+            seen_seconds=seen_seconds_from_slots(event.slot, launch_slot),
             signature=event.signature,
             slot=event.slot,
             block_time=self._block_time_dt(event.block_time),

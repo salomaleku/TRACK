@@ -9,6 +9,9 @@ PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 PUMP_TOTAL_SUPPLY = 1_000_000_000.0
 MIN_TRADE_SOL = 0.001
+SLOT_SECONDS = 0.4
+MIN_TIP_LAMPORTS = 100_000
+MAX_TIP_LAMPORTS = 50_000_000
 
 PUMP_BUY_DISCRIMINATORS = frozenset(
     {
@@ -180,6 +183,72 @@ def pump_trade_side(meta: dict[str, Any], transaction: dict[str, Any]) -> str | 
         if disc in PUMP_SELL_DISCRIMINATORS:
             return "sell"
     return None
+
+
+def wallet_sol_delta(meta: dict[str, Any], transaction: dict[str, Any], wallet: str) -> float | None:
+    keys = account_keys(meta, transaction)
+    try:
+        idx = keys.index(wallet)
+    except ValueError:
+        return None
+    delta = meta["postBalances"][idx] - meta["preBalances"][idx]
+    return delta / 1_000_000_000
+
+
+def tx_fee_sol(meta: dict[str, Any]) -> float:
+    return int(meta.get("fee") or 0) / 1_000_000_000
+
+
+def token_balance_pre_post(
+    meta: dict[str, Any], wallet: str, mint: str
+) -> tuple[float, float]:
+    pre = 0.0
+    post = 0.0
+    for entry in meta.get("preTokenBalances") or []:
+        if entry.get("owner") == wallet and entry.get("mint") == mint:
+            ui = entry.get("uiTokenAmount") or {}
+            pre = float(ui.get("uiAmount") or 0)
+    for entry in meta.get("postTokenBalances") or []:
+        if entry.get("owner") == wallet and entry.get("mint") == mint:
+            ui = entry.get("uiTokenAmount") or {}
+            post = float(ui.get("uiAmount") or 0)
+    return pre, post
+
+
+def extract_tip_sol(
+    meta: dict[str, Any],
+    transaction: dict[str, Any],
+    wallet: str,
+    main_transfer_lamports: int,
+) -> float:
+    """Largest small top-level SOL transfer from wallet (priority tip)."""
+    max_tip = 0
+    message = transaction.get("message", {})
+    for ix in message.get("instructions", []):
+        parsed = ix.get("parsed")
+        if not parsed or parsed.get("type") != "transfer":
+            continue
+        info = parsed.get("info") or {}
+        if info.get("source") != wallet:
+            continue
+        lamports = int(info.get("lamports") or 0)
+        if lamports == main_transfer_lamports:
+            continue
+        if MIN_TIP_LAMPORTS <= lamports <= MAX_TIP_LAMPORTS and lamports > max_tip:
+            max_tip = lamports
+    return max_tip / 1_000_000_000
+
+
+def seen_seconds_from_slots(trade_slot: int, launch_slot: int | None) -> int | None:
+    if launch_slot is None:
+        return None
+    return max(0, int((trade_slot - launch_slot) * SLOT_SECONDS))
+
+
+def display_symbol(symbol: str | None, mint: str) -> str:
+    if symbol:
+        return symbol
+    return mint[:4]
 
 
 def estimate_market_cap_usd(sol_amount: float, token_amount: float, sol_usd: float) -> float | None:

@@ -79,38 +79,87 @@ def _format_market_cap(usd: float | None) -> str:
     return f"${usd:.2f}"
 
 
+def _format_usd_signed(amount: float) -> str:
+    if amount >= 0:
+        return f"+${amount:.2f}"
+    return f"-${abs(amount):.2f}"
+
+
+def _format_sol_signed(amount: float) -> str:
+    if amount >= 0:
+        return f"+{amount:.2f}"
+    return f"{amount:.2f}"
+
+
+def _format_price_usd(price: float | None) -> str:
+    if price is None:
+        return "—"
+    if price >= 0.01:
+        return f"{price:.4f}"
+    if price >= 0.0001:
+        return f"{price:.6f}"
+    return f"{price:.8f}"
+
+
+def _format_seen(seconds: int | None) -> str | None:
+    if seconds is None:
+        return None
+    if seconds < 3600:
+        return f"Seen: {seconds}s"
+    hours = seconds // 3600
+    return f"Seen: {hours}h"
+
+
+def _format_tip_line(fee_sol: float, tip_sol: float) -> str:
+    if tip_sol > 0:
+        return f"💸 Fee: {fee_sol:.3f} SOL | Tip: {tip_sol:.3f} SOL"
+    return f"💸 Fee: {fee_sol:.3f} SOL"
+
+
+def _format_pnl_line(event: TradeEvent) -> str:
+    if event.pnl_usd is not None and event.pnl_pct is not None:
+        emoji = "📈" if event.pnl_usd >= 0 else "📉"
+        return f"{emoji} PnL: {_format_usd_signed(event.pnl_usd)} ({event.pnl_pct:+.1f}%)"
+    if event.pnl_pct is not None:
+        emoji = "📈" if event.pnl_pct >= 0 else "📉"
+        return f"{emoji} PnL: {event.pnl_pct:+.1f}%"
+    return "📉 PnL: —"
+
+
 def format_buy_message(
     event: TradeEvent,
     explorer_base: str,
     gmgn_token_base: str = "https://gmgn.ai/sol/token/",
 ) -> str:
-    symbol = event.token_symbol or "TOKEN"
-    name = event.token_name or symbol
+    symbol = event.token_symbol
     explorer = f"{explorer_base}{event.signature}"
     gmgn = f"{gmgn_token_base.rstrip('/')}/{event.token_mint}"
-    sol = f"{event.sol_amount:.2f}"
-    tokens = _format_token_amount_full(event.token_amount)
-    mc = _format_market_cap(event.market_cap_usd)
+    tokens_full = _format_token_amount_full(event.token_amount)
+    tokens_short = _format_token_amount(event.holds_tokens)
+    swap_usd = f"(${event.swap_usd:.2f})" if event.swap_usd is not None else ""
+    sol_delta_usd = _format_usd_signed(event.sol_delta_usd or 0)
+    token_delta_usd = _format_usd_signed(event.token_delta_usd or 0)
 
-    lines = [
-        f'<a href="{explorer}">🟢 BUY</a>',
-        f"<code>{name}</code> <b>(${symbol})</b>",
-        f"💰 <code>{sol} SOL</code> → <code>{tokens} tokens</code>",
-        f"📊 MC <code>{mc}</code>",
-    ]
-    if event.slot_diff is not None:
-        sign = "+" if event.slot_diff >= 0 else ""
-        lines.append(f"🧱 Slot diff <code>{sign}{event.slot_diff:,}</code>")
-    lines.extend(
-        [
-            "🪙 Mint",
-            f"<code>{event.token_mint}</code>",
-            "👨‍💻 Dev",
-            f"<code>{event.developer_wallet or '—'}</code>",
-            f'<a href="{gmgn}">📈 GMGN</a>',
-        ]
+    seen = _format_seen(event.seen_seconds)
+    footer_parts = [f"#{symbol}", f"MC: {_format_market_cap(event.market_cap_usd)}"]
+    if seen:
+        footer_parts.append(seen)
+    footer_parts.append(f'<a href="{gmgn}">GMGN</a>')
+
+    return (
+        f'<a href="{explorer}">🟢 BUY {symbol} on PumpFun</a>\n'
+        f"🔹 BOT\n"
+        f"<code>{event.wallet}</code>\n\n"
+        f"🔹 BOT swapped {event.sol_amount:.2f} SOL for {tokens_full} {swap_usd} {symbol}\n"
+        f"@${_format_price_usd(event.price_usd)}\n"
+        f"✊ Holds: {tokens_short} ({event.holds_pct:.2f}%)\n"
+        f"{_format_tip_line(event.fee_sol, event.tip_sol)}\n\n"
+        f"🔹 BOT:\n"
+        f"SOL: {_format_sol_signed(event.sol_delta)} ({sol_delta_usd})\n"
+        f"{symbol}: +{tokens_full} ({token_delta_usd})\n\n"
+        f"🔗 {' | '.join(footer_parts)}\n"
+        f"<code>{event.token_mint}</code>"
     )
-    return "\n".join(lines)
 
 
 def format_sell_message(
@@ -118,31 +167,52 @@ def format_sell_message(
     explorer_base: str,
     gmgn_token_base: str = "https://gmgn.ai/sol/token/",
 ) -> str:
-    symbol = event.token_symbol or "TOKEN"
-    name = event.token_name or symbol
+    symbol = event.token_symbol
     explorer = f"{explorer_base}{event.signature}"
     gmgn = f"{gmgn_token_base.rstrip('/')}/{event.token_mint}"
-    tokens = _format_token_amount_full(event.token_amount)
-    sol = f"{event.sol_amount:.2f}"
-    mc = _format_market_cap(event.market_cap_usd)
+    tokens_full = _format_token_amount_full(event.token_amount)
+    swap_usd = f"(${event.swap_usd:.2f})" if event.swap_usd is not None else ""
+    sol_delta_usd = _format_usd_signed(event.sol_delta_usd or 0)
+    token_delta_usd = _format_usd_signed(event.token_delta_usd or 0)
+    sold = f"{event.sold_pct:.0f}%" if event.sold_pct is not None else "—"
 
-    pnl_line = "📉 PnL —"
-    if event.pnl_pct is not None:
-        sold = f"{event.sold_pct:.0f}%" if event.sold_pct is not None else "—"
-        pnl_line = f"📉 PnL <code>{event.pnl_pct:+.2f}%</code> · Sold <code>{sold}</code>"
+    lines = [
+        f'<a href="{explorer}">🔴 SELL {symbol} on PumpFun</a>',
+        "🔹 BOT",
+        f"<code>{event.wallet}</code>",
+        "",
+        (
+            f"🔹 BOT swapped {tokens_full} {swap_usd} {symbol} "
+            f"for {event.sol_amount:.2f} SOL @${_format_price_usd(event.price_usd)}"
+        ),
+        f"➖ Sold: {sold}",
+        _format_pnl_line(event),
+    ]
 
-    return (
-        f'<a href="{explorer}">🔴 SELL</a>\n'
-        f"<code>{name}</code> <b>(${symbol})</b>\n"
-        f"💰 <code>{tokens} tokens</code> → <code>{sol} SOL</code>\n"
-        f"📊 MC <code>{mc}</code>\n"
-        f"{pnl_line}\n"
-        f"🪙 Mint\n"
-        f"<code>{event.token_mint}</code>\n"
-        f"👨‍💻 Dev\n"
-        f"<code>{event.developer_wallet or '—'}</code>\n"
-        f'<a href="{gmgn}">📈 GMGN</a>'
+    if event.holds_tokens > 0:
+        holds_short = _format_token_amount(event.holds_tokens)
+        lines.append(f"✊ Holds: {holds_short} ({event.holds_pct:.2f}%)")
+        if event.upnl_usd is not None:
+            lines.append(f"📈 uPnL: {_format_usd_signed(event.upnl_usd)}")
+
+    seen = _format_seen(event.seen_seconds)
+    footer_parts = [f"#{symbol}", f"MC: {_format_market_cap(event.market_cap_usd)}"]
+    if seen:
+        footer_parts.append(seen)
+    footer_parts.append(f'<a href="{gmgn}">GMGN</a>')
+
+    lines.extend(
+        [
+            "",
+            "🔹 BOT:",
+            f"SOL: {_format_sol_signed(event.sol_delta)} ({sol_delta_usd})",
+            f"{symbol}: -{tokens_full} ({token_delta_usd})",
+            "",
+            f"🔗 {' | '.join(footer_parts)}",
+            f"<code>{event.token_mint}</code>",
+        ]
     )
+    return "\n".join(lines)
 
 
 def format_launch_message(

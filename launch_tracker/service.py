@@ -444,40 +444,42 @@ class LaunchTrackerService:
         wallet = fee_payer(event.transaction)
         if not wallet or wallet not in self._config.my_wallets:
             return None
-
-        side = pump_trade_side(event.meta, event.transaction)
-        if side is None:
+        if pump_trade_side(event.meta, event.transaction) is None:
             return None
 
-        mint, delta = wallet_token_delta(event.meta, wallet)
+        mint, _ = wallet_token_delta(event.meta, wallet)
         if not mint:
             return None
 
         launch = await self._db.get_launch_by_mint(mint)
         launch_slot = int(launch["slot"]) if launch else None
-        developer = launch.get("developer_wallet") if launch else None
         token_name = launch.get("token_name") if launch else None
         token_symbol = launch.get("token_symbol") if launch else None
-
-        pnl_pct: float | None = None
-        sold_pct: float | None = None
 
         trade = self._trade_detector.detect(
             event,
             sol_usd=sol_usd,
             launch_slot=launch_slot,
-            developer_wallet=developer,
             token_name=token_name,
             token_symbol=token_symbol,
-            pnl_pct=pnl_pct,
-            sold_pct=sold_pct,
         )
-        if trade and side == "sell":
-            cost_for_sale, sold_pct = await self._db.preview_sell_position(
-                wallet, mint, trade.token_amount
-            )
-            if cost_for_sale > 0:
-                trade.pnl_pct = (trade.sol_amount - cost_for_sale) / cost_for_sale * 100.0
-            trade.sold_pct = sold_pct
+        if not trade or trade.side != "sell":
+            return trade
+
+        cost_for_sale, _ = await self._db.preview_sell_position(
+            wallet, mint, trade.token_amount
+        )
+        if cost_for_sale > 0:
+            pnl_sol = trade.sol_amount - cost_for_sale
+            trade.pnl_pct = pnl_sol / cost_for_sale * 100.0
+            trade.pnl_usd = pnl_sol * sol_usd
+
+        if trade.holds_tokens > 0 and cost_for_sale > 0:
+            held, cost = await self._db.get_position(wallet, mint)
+            remaining_cost = cost - cost_for_sale
+            if remaining_cost > 0 and trade.token_amount > 0:
+                price_sol = trade.sol_amount / trade.token_amount
+                remaining_value_sol = trade.holds_tokens * price_sol
+                trade.upnl_usd = (remaining_value_sol - remaining_cost) * sol_usd
 
         return trade
