@@ -7,6 +7,7 @@ import struct
 from datetime import datetime, timezone
 from typing import Any
 
+from launch_tracker.dev_buy import extract_dev_buy
 from launch_tracker.models import LaunchEvent, TransactionEvent
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,21 @@ class LaunchDetector:
             or self._detect_spl_mint(event, fee_payer)
             or self._detect_metaplex(event, fee_payer)
         )
+        if launch:
+            self._enrich_dev_buy(event, launch)
         return launch
+
+    def _enrich_dev_buy(self, event: TransactionEvent, launch: LaunchEvent) -> None:
+        sol, tokens, pct = extract_dev_buy(
+            event.meta,
+            event.transaction,
+            launch.developer_wallet,
+            launch.token_mint,
+            launch.platform,
+        )
+        launch.dev_buy_sol = sol
+        launch.dev_buy_tokens = tokens
+        launch.dev_buy_pct = pct
 
     def _fee_payer(self, transaction: dict[str, Any]) -> str | None:
         message = transaction.get("message", {})

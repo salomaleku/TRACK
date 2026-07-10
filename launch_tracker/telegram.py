@@ -6,14 +6,14 @@ import asyncio
 import logging
 import sys
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
 
 from launch_tracker.logging_setup import log_extra
-from launch_tracker.models import LaunchEvent
+from launch_tracker.models import LaunchEvent, TradeEvent, WatcherStatus
 
 if TYPE_CHECKING:
     from launch_tracker.database import Database
@@ -35,13 +35,124 @@ def _memory_usage_mb() -> float | None:
         return None
 
 
+def _format_token_amount(amount: float) -> str:
+    if amount >= 1_000_000:
+        return f"{amount / 1_000_000:.2f}M"
+    if amount >= 1_000:
+        return f"{amount / 1_000:.2f}K"
+    return f"{amount:,.2f}"
+
+
+def _format_token_amount_full(amount: float) -> str:
+    if amount >= 1:
+        return f"{amount:,.2f}".rstrip("0").rstrip(".")
+    return f"{amount:.6f}".rstrip("0").rstrip(".")
+
+
+def _format_dev_buy_section(event: LaunchEvent) -> str:
+    if event.dev_buy_sol is None or event.dev_buy_tokens is None:
+        return ""
+
+    symbol = event.token_symbol or "TOKEN"
+    tokens_full = _format_token_amount_full(event.dev_buy_tokens)
+    tokens_short = _format_token_amount(event.dev_buy_tokens)
+
+    lines = [
+        "💰 <b>Dev buy</b>",
+        (
+            f"Swapped <code>{event.dev_buy_sol:.2f} SOL</code> "
+            f"for <code>{tokens_full}</code> {symbol}"
+        ),
+    ]
+    if event.dev_buy_pct is not None:
+        lines.append(f"✊ Holds <code>{tokens_short} ({event.dev_buy_pct:.2f}%)</code>")
+    return "\n".join(lines) + "\n\n"
+
+
+def _format_market_cap(usd: float | None) -> str:
+    if usd is None:
+        return "—"
+    if usd >= 1_000_000:
+        return f"${usd / 1_000_000:.2f}M"
+    if usd >= 1_000:
+        return f"${usd / 1_000:.2f}K"
+    return f"${usd:.2f}"
+
+
+def format_buy_message(
+    event: TradeEvent,
+    explorer_base: str,
+    gmgn_token_base: str = "https://gmgn.ai/sol/token/",
+) -> str:
+    symbol = event.token_symbol or "TOKEN"
+    name = event.token_name or symbol
+    explorer = f"{explorer_base}{event.signature}"
+    gmgn = f"{gmgn_token_base.rstrip('/')}/{event.token_mint}"
+    sol = f"{event.sol_amount:.2f}"
+    tokens = _format_token_amount_full(event.token_amount)
+    mc = _format_market_cap(event.market_cap_usd)
+
+    lines = [
+        f'<a href="{explorer}">🟢 BUY</a>',
+        f"<code>{name}</code> <b>(${symbol})</b>",
+        f"💰 <code>{sol} SOL</code> → <code>{tokens} tokens</code>",
+        f"📊 MC <code>{mc}</code>",
+    ]
+    if event.slot_diff is not None:
+        sign = "+" if event.slot_diff >= 0 else ""
+        lines.append(f"🧱 Slot diff <code>{sign}{event.slot_diff:,}</code>")
+    lines.extend(
+        [
+            "🪙 Mint",
+            f"<code>{event.token_mint}</code>",
+            "👨‍💻 Dev",
+            f"<code>{event.developer_wallet or '—'}</code>",
+            f'<a href="{gmgn}">📈 GMGN</a>',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_sell_message(
+    event: TradeEvent,
+    explorer_base: str,
+    gmgn_token_base: str = "https://gmgn.ai/sol/token/",
+) -> str:
+    symbol = event.token_symbol or "TOKEN"
+    name = event.token_name or symbol
+    explorer = f"{explorer_base}{event.signature}"
+    gmgn = f"{gmgn_token_base.rstrip('/')}/{event.token_mint}"
+    tokens = _format_token_amount_full(event.token_amount)
+    sol = f"{event.sol_amount:.2f}"
+    mc = _format_market_cap(event.market_cap_usd)
+
+    pnl_line = "📉 PnL —"
+    if event.pnl_pct is not None:
+        sold = f"{event.sold_pct:.0f}%" if event.sold_pct is not None else "—"
+        pnl_line = f"📉 PnL <code>{event.pnl_pct:+.2f}%</code> · Sold <code>{sold}</code>"
+
+    return (
+        f'<a href="{explorer}">🔴 SELL</a>\n'
+        f"<code>{name}</code> <b>(${symbol})</b>\n"
+        f"💰 <code>{tokens} tokens</code> → <code>{sol} SOL</code>\n"
+        f"📊 MC <code>{mc}</code>\n"
+        f"{pnl_line}\n"
+        f"🪙 Mint\n"
+        f"<code>{event.token_mint}</code>\n"
+        f"👨‍💻 Dev\n"
+        f"<code>{event.developer_wallet or '—'}</code>\n"
+        f'<a href="{gmgn}">📈 GMGN</a>'
+    )
+
+
 def format_launch_message(
     event: LaunchEvent,
     explorer_base: str,
     gmgn_token_base: str = "https://gmgn.ai/sol/token/",
+    axiom_token_base: str = "https://axiom.trade/t/",
 ) -> str:
     time_str = (
-        event.block_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+        event.block_time.strftime("%H:%M:%S UTC")
         if event.block_time
         else "unknown"
     )
@@ -49,19 +160,92 @@ def format_launch_message(
     symbol = event.token_symbol or "—"
     explorer = f"{explorer_base}{event.signature}"
     gmgn = f"{gmgn_token_base.rstrip('/')}/{event.token_mint}"
+    axiom = f"{axiom_token_base.rstrip('/')}/{event.token_mint}"
+    dev_buy = _format_dev_buy_section(event)
 
     return (
         "🚀 <b>NEW DEV LAUNCH</b>\n\n"
-        f"<b>Developer</b>\n<code>{event.developer_wallet}</code>\n\n"
-        f"<b>Token</b>\n{name}\n\n"
-        f"<b>Ticker</b>\n{symbol}\n\n"
-        f"<b>Mint</b>\n<code>{event.token_mint}</code>\n\n"
-        f"<b>Platform</b>\n{event.platform}\n\n"
-        f"<b>Time</b>\n{time_str}\n\n"
-        f"<b>Slot</b>\n{event.slot}\n\n"
-        f"<b>Signature</b>\n<code>{event.signature}</code>\n\n"
-        f'<a href="{explorer}">Solscan</a> · '
-        f'<a href="{gmgn}">GMGN Chart</a>'
+        f"<code>{name}</code> <b>(${symbol})</b>\n\n"
+        f"{dev_buy}"
+        "👨‍💻 <b>Developer</b>\n"
+        f"<code>{event.developer_wallet}</code>\n\n"
+        "🪙 <b>Mint</b>\n"
+        f"<code>{event.token_mint}</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📍 <b>{event.platform}</b>\n"
+        f"🕒 <code>{time_str}</code>\n"
+        f"🧱 Slot: <code>{event.slot}</code>\n\n"
+        f'<a href="{explorer}">🔎 Solscan</a> • '
+        f'<a href="{gmgn}">📈 GMGN</a> • '
+        f'<a href="{axiom}">⚡ Axiom</a>'
+    )
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _format_ago(when: datetime | None) -> str:
+    if when is None:
+        return "never"
+    seconds = (datetime.now(timezone.utc) - when).total_seconds()
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
+
+
+def _stream_health(status: WatcherStatus) -> tuple[str, str]:
+    if not status.running:
+        return "🔴", "Stopped"
+    if status.developer_count == 0:
+        return "🔴", "No devs"
+    if status.last_stream_event_at is not None:
+        idle = (datetime.now(timezone.utc) - status.last_stream_event_at).total_seconds()
+        if idle < 600:
+            return "🟢", "Live"
+        if idle < 1800:
+            return "🟡", "Quiet"
+        return "🔴", "Stale"
+    if status.uptime_seconds < 180:
+        return "🟡", "Warming up"
+    if status.stream_events == 0:
+        return "🔴", "No stream data"
+    return "🟡", "Unknown"
+
+
+def format_status_message(status: WatcherStatus) -> str:
+    health_emoji, health_label = _stream_health(status)
+    stream_label = "Geyser gRPC" if status.stream_mode == "geyser" else "WebSocket"
+    env_label = "Server" if status.environment == "server" else "Local"
+    backfill = "on" if status.backfill_enabled else "off"
+
+    return (
+        f"{health_emoji} <b>Watcher {health_label}</b>\n\n"
+        f"📡 <b>Stream</b>: {stream_label}\n"
+        f"🌍 <b>Env</b>: {env_label}\n"
+        f"👥 <b>Devs</b>: <code>{status.developer_count}</code>\n"
+        f"⏱ <b>Uptime</b>: <code>{_format_duration(status.uptime_seconds)}</code>\n\n"
+        f"📥 <b>Stream tx</b>: <code>{status.stream_events}</code>\n"
+        f"⚙️ <b>Processed</b>: <code>{status.events_processed}</code>\n"
+        f"🕒 <b>Last tx</b>: <code>{_format_ago(status.last_stream_event_at)}</code>\n"
+        f"📋 <b>Queue</b>: <code>{status.tx_queue_size}</code>\n\n"
+        f"🚀 <b>Launches today</b>: <code>{status.launches_today}</code>\n"
+        f"🎯 <b>Total detected</b>: <code>{status.launches_detected}</code>\n"
+        f"🔄 <b>Reconnects</b>: <code>{status.reconnect_count}</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"RPC <code>{status.rpc_rps_limit:.0f}</code> rps · "
+        f"Backfill <code>{backfill}</code>"
     )
 
 
@@ -73,18 +257,22 @@ class TelegramService:
         database: Database,
         metrics: ServiceMetrics,
         get_metrics: Callable[[], ServiceMetrics],
+        get_status: Callable[[], Awaitable[WatcherStatus]],
         explorer_base: str,
         gmgn_token_base: str = "https://gmgn.ai/sol/token/",
+        axiom_token_base: str = "https://axiom.trade/t/",
     ) -> None:
         self._chat_id = chat_id
         self._db = database
         self._metrics = metrics
         self._get_metrics = get_metrics
+        self._get_status = get_status
         self._explorer_base = explorer_base
         self._gmgn_token_base = gmgn_token_base
+        self._axiom_token_base = axiom_token_base
         self._bot = Bot(token=token)
         self._dp = Dispatcher()
-        self._send_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+        self._send_queue: asyncio.Queue[LaunchEvent | TradeEvent] = asyncio.Queue()
         self._running = False
         self._tasks: list[asyncio.Task] = []
         self._register_handlers()
@@ -141,6 +329,15 @@ class TelegramService:
                 )
             await message.answer("\n".join(lines))
 
+        @self._dp.message(Command("status"))
+        async def cmd_status(message: Message) -> None:
+            status = await self._get_status()
+            await message.answer(
+                format_status_message(status),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
         @self._dp.message(Command("stats"))
         async def cmd_stats(message: Message) -> None:
             m = self._get_metrics()
@@ -160,6 +357,7 @@ class TelegramService:
                 f"<b>Reconnect count</b>\n{m.reconnect_count}\n\n"
                 f"<b>Events received</b>\n{m.events_received}\n\n"
                 f"<b>Launches detected</b>\n{m.launches_detected}\n\n"
+                f"<b>Trades detected</b>\n{m.trades_detected}\n\n"
                 f"<b>Backfill runs</b>\n{m.backfill_runs}\n\n"
                 f"<b>Avg detection latency</b>\n{m.avg_detection_latency_ms:.0f}ms\n\n"
                 f"<b>Avg processing time</b>\n{m.avg_processing_time_ms:.0f}ms\n\n"
@@ -180,6 +378,7 @@ class TelegramService:
         environment: str = "local",
         rpc_rps_limit: float = 10.0,
         stream_mode: str = "websocket",
+        my_wallet_count: int = 0,
     ) -> None:
         backfill_line = (
             f"Backfill: каждые {backfill_interval_minutes} мин"
@@ -196,6 +395,7 @@ class TelegramService:
             f"<b>Режим</b>: {env_label}\n"
             f"<b>Stream</b>: {stream_label}\n"
             f"<b>Разработчиков</b>: {developer_count}\n"
+            f"<b>Мои кошельки</b>: {my_wallet_count}\n"
             f"<b>RPC лимит</b>: {rpc_rps_limit:.0f} RPS\n"
             f"<b>{backfill_line}</b>"
         )
@@ -236,6 +436,9 @@ class TelegramService:
     async def notify_launch(self, event: LaunchEvent) -> None:
         await self._send_queue.put(event)
 
+    async def notify_trade(self, event: TradeEvent) -> None:
+        await self._send_queue.put(event)
+
     async def _sender_loop(self) -> None:
         while self._running:
             try:
@@ -243,11 +446,25 @@ class TelegramService:
             except asyncio.TimeoutError:
                 continue
             try:
-                text = format_launch_message(
-                    event,
-                    self._explorer_base,
-                    self._gmgn_token_base,
-                )
+                if isinstance(event, LaunchEvent):
+                    text = format_launch_message(
+                        event,
+                        self._explorer_base,
+                        self._gmgn_token_base,
+                        self._axiom_token_base,
+                    )
+                elif event.side == "buy":
+                    text = format_buy_message(
+                        event,
+                        self._explorer_base,
+                        self._gmgn_token_base,
+                    )
+                else:
+                    text = format_sell_message(
+                        event,
+                        self._explorer_base,
+                        self._gmgn_token_base,
+                    )
                 await self._bot.send_message(
                     self._chat_id,
                     text,
@@ -255,22 +472,25 @@ class TelegramService:
                     disable_web_page_preview=True,
                 )
                 self._metrics.telegram_sent += 1
+                sig = event.signature
+                mint = event.token_mint if hasattr(event, "token_mint") else getattr(event, "token_mint", "")
                 log_extra(
                     logger,
                     logging.INFO,
                     "Telegram sent",
                     event="telegram_sent",
-                    signature=event.signature,
-                    mint=event.token_mint,
+                    signature=sig,
+                    mint=mint,
                 )
             except Exception as exc:
                 self._metrics.telegram_failed += 1
+                sig = getattr(event, "signature", "")
                 log_extra(
                     logger,
                     logging.ERROR,
                     "Telegram send failed",
                     event="telegram_failed",
-                    signature=event.signature,
+                    signature=sig,
                     error=str(exc),
                 )
 

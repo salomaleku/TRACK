@@ -48,6 +48,30 @@ CREATE TABLE IF NOT EXISTS service_state (
 CREATE INDEX IF NOT EXISTS idx_launches_developer ON launches(developer_wallet);
 CREATE INDEX IF NOT EXISTS idx_launches_detected_at ON launches(detected_at);
 CREATE INDEX IF NOT EXISTS idx_launches_block_time ON launches(block_time);
+
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet TEXT NOT NULL,
+    mint TEXT NOT NULL,
+    side TEXT NOT NULL,
+    sol REAL NOT NULL,
+    tokens REAL NOT NULL,
+    signature TEXT NOT NULL UNIQUE,
+    slot INTEGER NOT NULL,
+    block_time TEXT,
+    detected_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS positions (
+    wallet TEXT NOT NULL,
+    mint TEXT NOT NULL,
+    tokens_held REAL NOT NULL DEFAULT 0,
+    cost_basis_sol REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (wallet, mint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trades_wallet_mint ON trades(wallet, mint);
+CREATE INDEX IF NOT EXISTS idx_launches_mint ON launches(token_mint);
 """
 
 
@@ -204,6 +228,128 @@ class Database:
             (key, value),
         )
         await self._conn.commit()
+
+    async def get_launch_by_mint(self, mint: str) -> dict | None:
+        assert self._conn is not None
+        async with self._conn.execute(
+            """
+            SELECT * FROM launches
+            WHERE token_mint = ?
+            ORDER BY slot ASC
+            LIMIT 1
+            """,
+            (mint,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_position(self, wallet: str, mint: str) -> tuple[float, float]:
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT tokens_held, cost_basis_sol FROM positions WHERE wallet = ? AND mint = ?",
+            (wallet, mint),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return 0.0, 0.0
+            return float(row[0]), float(row[1])
+
+    async def save_trade(
+        self,
+        wallet: str,
+        mint: str,
+        side: str,
+        sol: float,
+        tokens: float,
+        signature: str,
+        slot: int,
+        block_time: datetime | None,
+    ) -> bool:
+        """Returns False if trade signature already exists."""
+        assert self._conn is not None
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            await self._conn.execute(
+                """
+                INSERT INTO trades (
+                    wallet, mint, side, sol, tokens, signature, slot, block_time, detected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    wallet,
+                    mint,
+                    side,
+                    sol,
+                    tokens,
+                    signature,
+                    slot,
+                    block_time.isoformat() if block_time else None,
+                    now,
+                ),
+            )
+            await self._conn.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+    async def apply_buy_position(self, wallet: str, mint: str, sol: float, tokens: float) -> None:
+        assert self._conn is not None
+        held, cost = await self.get_position(wallet, mint)
+        await self._conn.execute(
+            """
+            INSERT INTO positions (wallet, mint, tokens_held, cost_basis_sol)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(wallet, mint) DO UPDATE SET
+                tokens_held = excluded.tokens_held,
+                cost_basis_sol = excluded.cost_basis_sol
+            """,
+            (wallet, mint, held + tokens, cost + sol),
+        )
+        await self._conn.commit()
+
+    async def preview_sell_position(
+        self, wallet: str, mint: str, tokens_sold: float
+    ) -> tuple[float, float]:
+        """Return (cost_basis_sol_for_sale, sold_pct) without updating position."""
+        held, cost = await self.get_position(wallet, mint)
+        if held <= 0 or tokens_sold <= 0:
+            return 0.0, 100.0 if tokens_sold > 0 else 0.0
+        sold_pct = min(100.0, tokens_sold / held * 100.0)
+        cost_for_sale = cost * (tokens_sold / held)
+        return cost_for_sale, sold_pct
+
+    async def apply_sell_position(
+        self, wallet: str, mint: str, tokens_sold: float
+    ) -> tuple[float, float]:
+        """Return (cost_basis_sol_for_sale, sold_pct). Updates position."""
+        assert self._conn is not None
+        held, cost = await self.get_position(wallet, mint)
+        if held <= 0 or tokens_sold <= 0:
+            return 0.0, 100.0 if tokens_sold > 0 else 0.0
+
+        sold_pct = min(100.0, tokens_sold / held * 100.0)
+        cost_for_sale = cost * (tokens_sold / held)
+        remaining_tokens = max(0.0, held - tokens_sold)
+        remaining_cost = max(0.0, cost - cost_for_sale)
+
+        if remaining_tokens <= 0:
+            await self._conn.execute(
+                "DELETE FROM positions WHERE wallet = ? AND mint = ?",
+                (wallet, mint),
+            )
+        else:
+            await self._conn.execute(
+                """
+                INSERT INTO positions (wallet, mint, tokens_held, cost_basis_sol)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(wallet, mint) DO UPDATE SET
+                    tokens_held = excluded.tokens_held,
+                    cost_basis_sol = excluded.cost_basis_sol
+                """,
+                (wallet, mint, remaining_tokens, remaining_cost),
+            )
+        await self._conn.commit()
+        return cost_for_sale, sold_pct
 
     async def get_state(self, key: str) -> str | None:
         assert self._conn is not None

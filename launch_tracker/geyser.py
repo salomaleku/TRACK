@@ -116,6 +116,10 @@ class GeyserTransactionStream(TransactionWebSocket):
     def reconnect_count(self) -> int:
         return self._reconnect_count
 
+    @property
+    def stream_events(self) -> int:
+        return self._events_received
+
     async def connect(self) -> None:
         if self._running:
             return

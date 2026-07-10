@@ -70,6 +70,10 @@ class TransactionWebSocket(ABC):
     @abstractmethod
     def reconnect_count(self) -> int: ...
 
+    @property
+    def stream_events(self) -> int:
+        return 0
+
 
 class JsonRpcWebSocket(TransactionWebSocket):
     """JSON-RPC WebSocket client with reconnect, backoff, and heartbeat."""
@@ -104,6 +108,10 @@ class JsonRpcWebSocket(TransactionWebSocket):
     @property
     def reconnect_count(self) -> int:
         return self._reconnect_count
+
+    @property
+    def stream_events(self) -> int:
+        return self._ws_events
 
     async def connect(self) -> None:
         if self._running:

@@ -23,6 +23,12 @@ def _int(value: str | None, default: int) -> int:
     return int(value)
 
 
+def _wallet_set(value: str | None, default: str = "") -> frozenset[str]:
+    raw = value if value is not None else default
+    wallets = {w.strip() for w in raw.split(",") if w.strip()}
+    return frozenset(wallets)
+
+
 def _collect_endpoints(*keys: str) -> list[str]:
     seen: set[str] = set()
     endpoints: list[str] = []
@@ -43,7 +49,9 @@ class Config:
     grpc_endpoint: str
     grpc_x_token: str
     devs_file: Path
+    my_wallets: frozenset[str]
     database: Path
+    sol_usd_price: float
     telegram_token: str
     telegram_chat_id: str
     backfill_enabled: bool
@@ -71,6 +79,7 @@ class Config:
     devs_reload_seconds: float
     explorer_base: str
     gmgn_token_base: str
+    axiom_token_base: str
 
     @classmethod
     def from_env(cls) -> Config:
@@ -109,7 +118,12 @@ class Config:
             grpc_endpoint=os.getenv("GRPC_ENDPOINT", "").strip(),
             grpc_x_token=os.getenv("GRPC_X_TOKEN", "").strip(),
             devs_file=Path(os.getenv("DEVS_FILE", "data/devs.txt")),
+            my_wallets=_wallet_set(
+                os.getenv("MY_WALLETS"),
+                default="34V5EApKJP8XCoLGnQgf6NmAw7RSCZM8R9GJVikkSvqa",
+            ),
             database=Path(os.getenv("DATABASE", "data/launch_tracker.db")),
+            sol_usd_price=float(os.getenv("SOL_USD_PRICE", "75")),
             telegram_token=os.getenv("TELEGRAM_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             backfill_enabled=_bool(os.getenv("BACKFILL_ENABLED"), True),
@@ -134,6 +148,9 @@ class Config:
             explorer_base=os.getenv("EXPLORER_BASE", "https://solscan.io/tx/").strip(),
             gmgn_token_base=os.getenv(
                 "GMGN_TOKEN_BASE", "https://gmgn.ai/sol/token/"
+            ).strip(),
+            axiom_token_base=os.getenv(
+                "AXIOM_TOKEN_BASE", "https://axiom.trade/t/"
             ).strip(),
         )
 
